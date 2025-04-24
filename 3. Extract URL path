@@ -1,1 +1,80 @@
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.io.ByteArrayOutputStream;
+
+public class Main {
+  public static void main(String[] args) {
+    System.out.println("Logs from your program will appear here!");
+
+    try (ServerSocket serverSocket = new ServerSocket(4221)) {
+      serverSocket.setReuseAddress(true);
+
+      while (true) {
+        Socket clientSocket = serverSocket.accept();
+        System.out.println("accepted new connection");
+
+        InputStream in = clientSocket.getInputStream();
+        OutputStream out = clientSocket.getOutputStream();
+
+        ByteArrayOutputStream requestBuffer = new ByteArrayOutputStream();
+        byte[] buffer = new byte[1024];
+        int bytesRead;
+
+        // Read until end of headers (\r\n\r\n)
+        while ((bytesRead = in.read(buffer)) != -1) {
+          requestBuffer.write(buffer, 0, bytesRead);
+          String currentRequest = requestBuffer.toString();
+          if (currentRequest.contains("\r\n\r\n")) {
+            break;
+          }
+        }
+
+        String request = requestBuffer.toString();
+        System.out.println("Received request:\n" + request);
+
+        // Get the request line
+        String[] requestLines = request.split("\r\n");
+        if (requestLines.length == 0) {
+          clientSocket.close();
+          continue;
+        }
+
+        String requestLine = requestLines[0];
+        System.out.println("Request line: " + requestLine);
+
+        String[] parts = requestLine.split(" ");
+        if (parts.length < 2) {
+          clientSocket.close();
+          continue;
+        }
+
+        // Extract and clean path
+        String path = parts[1].replaceAll("[\\r\\n]", "").trim();
+        System.out.println("Request path: [" + path + "]");
+
+        String response;
+
+        // ⚠️ Make sure to respond with 200 OK if path is "/"
+        if ("/".equals(path)) {
+          response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        } else {
+          response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+        }
+
+        out.write(response.getBytes());
+        out.flush();
+        System.out.println("sent response: " + response);
+
+        clientSocket.close();
+        System.out.println("connection closed");
+      }
+
+    } catch (Exception e) {
+      System.out.println("Exception: " + e.getMessage());
+      e.printStackTrace();
+    }
+  }
+}
 
