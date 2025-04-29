@@ -1,1 +1,132 @@
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+
+public class Main {
+    public static void main(String[] args) throws IOException {
+        // Read the file directory from CLI args
+        String fileDirectory = (args.length >= 2 && args[0].equals("--directory")) ? args[1] : ".";
+
+        ServerSocket serverSocket = new ServerSocket(4221);
+        serverSocket.setReuseAddress(true);
+
+        while (true) {
+            Socket clientSocket = serverSocket.accept();
+            new Thread(() -> handleClient(clientSocket, fileDirectory)).start();
+        }
+    }
+
+    private static void handleClient(Socket socket, String fileDirectory) {
+        try (
+            InputStream in = socket.getInputStream();
+            OutputStream out = socket.getOutputStream()
+        ) {
+            // Read headers
+            ByteArrayOutputStream headerBuffer = new ByteArrayOutputStream();
+            int prev = 0, curr;
+            while ((curr = in.read()) != -1) {
+                headerBuffer.write(curr);
+                if (prev == '\r' && curr == '\n') {
+                    byte[] check = headerBuffer.toByteArray();
+                    if (endsWithDoubleCRLF(check)) break;
+                }
+                prev = curr;
+            }
+
+            byte[] headerBytes = headerBuffer.toByteArray();
+            String headers = new String(headerBytes, "UTF-8");
+
+            String[] lines = headers.split("\r\n");
+            if (lines.length == 0) return;
+
+            String[] requestLine = lines[0].split(" ");
+            if (requestLine.length < 3) return;
+            String method = requestLine[0];
+            String path = requestLine[1];
+
+            int contentLength = 0;
+            String userAgent = "";
+            String acceptEncoding = "";
+
+            // Process headers
+            for (String line : lines) {
+                if (line.startsWith("Content-Length:")) {
+                    contentLength = Integer.parseInt(line.substring("Content-Length:".length()).trim());
+                } else if (line.startsWith("User-Agent:")) {
+                    userAgent = line.substring("User-Agent:".length()).trim();
+                } else if (line.startsWith("Accept-Encoding:")) {
+                    acceptEncoding = line.substring("Accept-Encoding:".length()).trim();
+                }
+            }
+
+            boolean gzipRequested = acceptEncoding.contains("gzip");
+
+            // Handle POST method to upload files
+            if (method.equals("POST") && path.startsWith("/files/")) {
+                // Handle file upload (same as previous)
+                String fileName = path.substring("/files/".length());
+                Path filePath = Paths.get(fileDirectory, fileName);
+                byte[] body = in.readNBytes(contentLength);
+                Files.write(filePath, body);
+                out.write("HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n".getBytes());
+
+            } else if (method.equals("GET")) {
+                if (path.equals("/")) {
+                    out.write("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".getBytes());
+                } else if (path.startsWith("/echo/")) {
+                    String msg = path.substring("/echo/".length());
+                    String response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
+                                      msg.length() + "\r\n";
+                    if (gzipRequested) {
+                        response += "Content-Encoding: gzip\r\n";
+                    }
+                    response += "\r\n" + msg;
+                    out.write(response.getBytes());
+                } else if (path.startsWith("/files/")) {
+                    // Handle file retrieval
+                    String fileName = path.substring("/files/".length());
+                    Path filePath = Paths.get(fileDirectory, fileName);
+                    if (Files.exists(filePath) && Files.isRegularFile(filePath)) {
+                        byte[] content = Files.readAllBytes(filePath);
+                        String response = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: " +
+                                          content.length + "\r\n";
+                        if (gzipRequested) {
+                            response += "Content-Encoding: gzip\r\n";
+                        }
+                        response += "\r\n";
+                        out.write(response.getBytes());
+                        out.write(content);
+                    } else {
+                        out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".getBytes());
+                    }
+                } else if (path.startsWith("/user-agent")) {
+                    // Handle /user-agent route
+                    String response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
+                                      userAgent.length() + "\r\n\r\n" + userAgent;
+                    out.write(response.getBytes());
+                } else {
+                    out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".getBytes());
+                }
+            } else {
+                out.write("HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n".getBytes());
+            }
+
+            out.flush();
+            socket.close();
+        } catch (IOException e) {
+            System.out.println("Error: " + e.getMessage());
+        }
+    }
+
+    private static boolean endsWithDoubleCRLF(byte[] byteArray) {
+        return byteArray.length >= 4 && byteArray[byteArray.length - 4] == '\r' && byteArray[byteArray.length - 3] == '\n' &&
+                byteArray[byteArray.length - 2] == '\r' && byteArray[byteArray.length - 1] == '\n';
+    }
+}
 
