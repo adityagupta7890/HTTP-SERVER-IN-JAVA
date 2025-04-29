@@ -1,1 +1,73 @@
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.ServerSocket;
+import java.net.Socket;
+
+public class Main {
+    public static void main(String[] args) {
+        System.out.println("Logs from your program will appear here!");
+
+        try {
+            ServerSocket serverSocket = new ServerSocket(4221);
+            serverSocket.setReuseAddress(true);
+
+            while (true) {
+                Socket clientSocket = serverSocket.accept();
+                System.out.println("accepted new connection");
+
+                BufferedReader in = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
+                OutputStream out = clientSocket.getOutputStream();
+
+                String requestLine = in.readLine();
+                System.out.println("Received request: " + requestLine);
+
+                if (requestLine != null && !requestLine.isEmpty()) {
+                    String[] parts = requestLine.split(" ");
+                    if (parts.length >= 2) {
+                        String path = parts[1];
+                        System.out.println("Request path: [" + path + "]");
+
+                        if (path.equals("/")) {
+                            String responseBody = "";
+                            String response = "HTTP/1.1 200 OK\r\n" +
+                                              "Content-Type: text/plain\r\n" +
+                                              "Content-Length: " + responseBody.length() + "\r\n" +
+                                              "\r\n" +
+                                              responseBody;
+
+                            out.write(response.getBytes("UTF-8"));
+                            System.out.println("Sent response for /");
+                        } else if (path.startsWith("/echo/")) {
+                            String toEcho = path.substring("/echo/".length());
+                            String responseBody = toEcho;
+
+                            String response = "HTTP/1.1 200 OK\r\n" +
+                                              "Content-Type: text/plain\r\n" +
+                                              "Content-Length: " + responseBody.length() + "\r\n" +
+                                              "\r\n" +
+                                              responseBody;
+
+                            out.write(response.getBytes("UTF-8"));
+                            System.out.println("Sent response:\n" + response);
+                        } else {
+                            String response = "HTTP/1.1 404 Not Found\r\n" +
+                                              "Content-Length: 0\r\n" +
+                                              "\r\n";
+                            out.write(response.getBytes("UTF-8"));
+                            System.out.println("Sent 404 response");
+                        }
+                    }
+                }
+
+                out.flush();
+                clientSocket.close();
+            }
+
+        } catch (IOException e) {
+            System.out.println("IOException: " + e.getMessage());
+        }
+    }
+}
 
