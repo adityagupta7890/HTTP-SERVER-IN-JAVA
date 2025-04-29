@@ -1,0 +1,211 @@
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.zip.GZIPOutputStream;
+
+public class Main {
+    public static void main(String[] args) throws IOException {
+        // Read the file directory from CLI args
+        String fileDirectory = (args.length >= 2 && args[0].equals("--directory")) ? args[1] : ".";
+
+        // Start server socket
+        try (ServerSocket serverSocket = new ServerSocket(4221)) {
+            serverSocket.setReuseAddress(true);
+            while (true) {
+                Socket clientSocket = serverSocket.accept();
+                new Thread(() -> handleClient(clientSocket, fileDirectory)).start();
+            }
+        }
+    }
+
+    private static void handleClient(Socket socket, String fileDirectory) {
+        try (
+            InputStream in = socket.getInputStream();
+            OutputStream out = socket.getOutputStream()
+        ) {
+            // Read headers
+            String headers = readHeaders(in);
+
+            // Parse the request
+            String[] requestLine = headers.split("\r\n")[0].split(" ");
+            String method = requestLine[0];
+            String path = requestLine[1];
+
+            // Parse headers for Content-Length, User-Agent, and Accept-Encoding
+            int contentLength = 0;
+            String userAgent = "";
+            String acceptEncoding = "";
+            for (String line : headers.split("\r\n")) {
+                if (line.startsWith("Content-Length:")) {
+                    contentLength = Integer.parseInt(line.substring("Content-Length:".length()).trim());
+                } else if (line.startsWith("User-Agent:")) {
+                    userAgent = line.substring("User-Agent:".length()).trim();
+                } else if (line.startsWith("Accept-Encoding:")) {
+                    acceptEncoding = line.substring("Accept-Encoding:".length()).trim();
+                }
+            }
+
+            boolean gzipRequested = acceptEncoding.contains("gzip");
+
+            // Handle POST method to upload files
+            if ("POST".equals(method) && path.startsWith("/files/")) {
+                String fileName = path.substring("/files/".length());
+                Path filePath = Paths.get(fileDirectory, fileName);
+                byte[] body = in.readNBytes(contentLength);
+                Files.write(filePath, body);
+                sendResponse(out, 201, "", gzipRequested, fileDirectory, path);
+
+            } else if ("GET".equals(method)) {
+                if ("/".equals(path)) {
+                    sendResponse(out, 200, "", gzipRequested, fileDirectory, path);
+                } else if (path.startsWith("/echo/")) {
+                    String msg = path.substring("/echo/".length());
+                    sendResponse(out, 200, msg, gzipRequested, fileDirectory, path);
+                } else if (path.startsWith("/files/")) {
+                    String fileName = path.substring("/files/".length());
+                    Path filePath = Paths.get(fileDirectory, fileName);
+                    if (Files.exists(filePath) && Files.isRegularFile(filePath)) {
+                        byte[] content = Files.readAllBytes(filePath);
+                        sendResponse(out, 200, new String(content), gzipRequested, fileDirectory, path);
+                    } else {
+                        sendResponse(out, 404, "", gzipRequested, fileDirectory, path);
+                    }
+                } else if (path.startsWith("/user-agent")) {
+                    sendResponse(out, 200, userAgent, gzipRequested, fileDirectory, path);
+                } else {
+                    sendResponse(out, 404, "", gzipRequested, fileDirectory, path);
+                }
+            } else {
+                sendResponse(out, 405, "", gzipRequested, fileDirectory, path);
+            }
+
+            out.flush();
+        } catch (IOException e) {
+            System.out.println("Error: " + e.getMessage());
+        }
+    }
+
+    private static String readHeaders(InputStream in) throws IOException {
+        ByteArrayOutputStream headerBuffer = new ByteArrayOutputStream();
+        int prev = 0, curr;
+        while ((curr = in.read()) != -1) {
+            headerBuffer.write(curr);
+            if (prev == '\r' && curr == '\n') {
+                byte[] check = headerBuffer.toByteArray();
+                if (endsWithDoubleCRLF(check)) break;
+            }
+            prev = curr;
+        }
+        return new String(headerBuffer.toByteArray(), "UTF-8");
+    }
+
+    private static boolean endsWithDoubleCRLF(byte[] byteArray) {
+        return byteArray.length >= 4 && byteArray[byteArray.length - 4] == '\r' && byteArray[byteArray.length - 3] == '\n' &&
+                byteArray[byteArray.length - 2] == '\r' && byteArray[byteArray.length - 1] == '\n';
+    }
+
+    private static void sendResponse(OutputStream out, int statusCode, String content, boolean gzipRequested, String fileDirectory, String path) throws IOException {
+        String statusMessage = (statusCode == 200) ? "OK" :
+                               (statusCode == 201) ? "Created" :
+                               (statusCode == 404) ? "Not Found" :
+                               (statusCode == 405) ? "Method Not Allowed" : "Internal Server Error";
+
+        byte[] responseBytes = content.getBytes("UTF-8");
+
+        StringBuilder headers = new StringBuilder();
+        headers.append("HTTP/1.1 ").append(statusCode).append(" ").append(statusMessage).append("\r\n");
+
+        // Determine Content-Type based on file path or extension
+        String contentType = "text/plain"; // Default for text
+        if (path.startsWith("/files/")) {
+            Path filePath = Paths.get(fileDirectory, path.substring("/files/".length()));
+            if (Files.exists(filePath) && Files.isRegularFile(filePath)) {
+                String fileExtension = getFileExtension(filePath);
+                contentType = getContentTypeForExtension(fileExtension);
+            }
+        }
+
+        headers.append("Content-Type: ").append(contentType).append("\r\n");
+
+        // GZIP header adjustments for compressed content
+        if (gzipRequested) {
+            headers.append("Content-Encoding: gzip\r\n");
+        }
+
+        // Calculate Content-Length first, then add it to the header
+        int contentLength = responseBytes.length;
+        if (gzipRequested) {
+            try (ByteArrayOutputStream byteStream = new ByteArrayOutputStream();
+                 GZIPOutputStream gzipOut = new GZIPOutputStream(byteStream)) {
+                gzipOut.write(responseBytes);
+                gzipOut.finish();
+                byte[] compressedData = byteStream.toByteArray();
+                contentLength = compressedData.length;  // Set content length to the size of the compressed data
+
+                // Send the length of the compressed data before the body
+                headers.append("Content-Length: ").append(contentLength).append("\r\n");
+            }
+        } else {
+            headers.append("Content-Length: ").append(contentLength).append("\r\n");
+        }
+
+        headers.append("\r\n");
+        out.write(headers.toString().getBytes("UTF-8"));
+        out.flush();  // Ensure headers are sent before the body
+
+        // Handle sending the response body
+        if (gzipRequested) {
+            try (ByteArrayOutputStream byteStream = new ByteArrayOutputStream();
+                 GZIPOutputStream gzipOut = new GZIPOutputStream(byteStream)) {
+                gzipOut.write(responseBytes);
+                gzipOut.finish();
+                byte[] compressedData = byteStream.toByteArray();
+                out.write(compressedData);  // Write the compressed body
+            }
+        } else {
+            // Send the uncompressed body
+            out.write(responseBytes);
+        }
+    }
+
+    private static String getFileExtension(Path filePath) {
+        String fileName = filePath.toString();
+        int dotIndex = fileName.lastIndexOf('.');
+        return (dotIndex == -1) ? "" : fileName.substring(dotIndex + 1);
+    }
+
+    private static String getContentTypeForExtension(String extension) {
+        switch (extension.toLowerCase()) {
+            case "html":
+            case "htm":
+                return "text/html";
+            case "json":
+                return "application/json";
+            case "xml":
+                return "application/xml";
+            case "jpg":
+            case "jpeg":
+                return "image/jpeg";
+            case "png":
+                return "image/png";
+            case "gif":
+                return "image/gif";
+            case "css":
+                return "text/css";
+            case "js":
+                return "application/javascript";
+            case "txt":
+                return "text/plain";
+            case "pdf":
+                return "application/pdf";
+            default:
+                return "application/octet-stream"; // Default for binary files
+        }
+    }
+}
