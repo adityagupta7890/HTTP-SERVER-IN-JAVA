@@ -1,1 +1,190 @@
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.zip.GZIPOutputStream;
+
+public class Main {
+    public static void main(String[] args) throws IOException {
+        String fileDirectory = (args.length >= 2 && args[0].equals("--directory")) ? args[1] : ".";
+
+        try (ServerSocket serverSocket = new ServerSocket(4221)) {
+            serverSocket.setReuseAddress(true);
+            while (true) {
+                Socket clientSocket = serverSocket.accept();
+                new Thread(() -> handleClient(clientSocket, fileDirectory)).start();
+            }
+        }
+    }
+
+    private static void handleClient(Socket socket, String fileDirectory) {
+        try (
+            InputStream in = socket.getInputStream();
+            OutputStream out = socket.getOutputStream()
+        ) {
+            while (true) {
+                String headers = readHeaders(in);
+                if (headers == null || headers.isEmpty()) break;
+
+                String[] requestLine = headers.split("\r\n")[0].split(" ");
+                if (requestLine.length < 2) break;
+
+                String method = requestLine[0];
+                String path = requestLine[1];
+
+                int contentLength = 0;
+                String userAgent = "";
+                String acceptEncoding = "";
+                String connectionHeader = "keep-alive";  // default per HTTP/1.1
+
+                for (String line : headers.split("\r\n")) {
+                    if (line.startsWith("Content-Length:")) {
+                        contentLength = Integer.parseInt(line.substring("Content-Length:".length()).trim());
+                    } else if (line.startsWith("User-Agent:")) {
+                        userAgent = line.substring("User-Agent:".length()).trim();
+                    } else if (line.startsWith("Accept-Encoding:")) {
+                        acceptEncoding = line.substring("Accept-Encoding:".length()).trim();
+                    } else if (line.startsWith("Connection:")) {
+                        connectionHeader = line.substring("Connection:".length()).trim();
+                    }
+                }
+
+                boolean gzipRequested = acceptEncoding.contains("gzip");
+                boolean keepAlive = !connectionHeader.equalsIgnoreCase("close");
+
+                if ("POST".equals(method) && path.startsWith("/files/")) {
+                    String fileName = path.substring("/files/".length());
+                    Path filePath = Paths.get(fileDirectory, fileName);
+                    byte[] body = in.readNBytes(contentLength);
+                    Files.write(filePath, body);
+                    sendResponse(out, 201, "", gzipRequested, keepAlive, fileDirectory, path);
+                } else if ("GET".equals(method)) {
+                    if ("/".equals(path)) {
+                        sendResponse(out, 200, "", gzipRequested, keepAlive, fileDirectory, path);
+                    } else if (path.startsWith("/echo/")) {
+                        String msg = path.substring("/echo/".length());
+                        sendResponse(out, 200, msg, gzipRequested, keepAlive, fileDirectory, path);
+                    } else if (path.startsWith("/files/")) {
+                        String fileName = path.substring("/files/".length());
+                        Path filePath = Paths.get(fileDirectory, fileName);
+                        if (Files.exists(filePath) && Files.isRegularFile(filePath)) {
+                            byte[] content = Files.readAllBytes(filePath);
+                            sendResponse(out, 200, new String(content), gzipRequested, keepAlive, fileDirectory, path);
+                        } else {
+                            sendResponse(out, 404, "", gzipRequested, keepAlive, fileDirectory, path);
+                        }
+                    } else if (path.startsWith("/user-agent")) {
+                        sendResponse(out, 200, userAgent, gzipRequested, keepAlive, fileDirectory, path);
+                    } else {
+                        sendResponse(out, 404, "", gzipRequested, keepAlive, fileDirectory, path);
+                    }
+                } else {
+                    sendResponse(out, 405, "", gzipRequested, keepAlive, fileDirectory, path);
+                }
+
+                out.flush();
+
+                if (!keepAlive) break;
+            }
+        } catch (IOException e) {
+            System.out.println("Error: " + e.getMessage());
+        } finally {
+            try {
+                socket.close();
+            } catch (IOException ignored) {}
+        }
+    }
+
+    private static String readHeaders(InputStream in) throws IOException {
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        int prev = 0, curr;
+        while ((curr = in.read()) != -1) {
+            buffer.write(curr);
+            if (prev == '\r' && curr == '\n') {
+                byte[] arr = buffer.toByteArray();
+                if (endsWithDoubleCRLF(arr)) break;
+            }
+            prev = curr;
+        }
+
+        return buffer.size() == 0 ? null : new String(buffer.toByteArray(), "UTF-8");
+    }
+
+    private static boolean endsWithDoubleCRLF(byte[] data) {
+        int len = data.length;
+        return len >= 4 &&
+               data[len - 4] == '\r' &&
+               data[len - 3] == '\n' &&
+               data[len - 2] == '\r' &&
+               data[len - 1] == '\n';
+    }
+
+    private static void sendResponse(OutputStream out, int statusCode, String content, boolean gzipRequested, boolean keepAlive, String fileDirectory, String path) throws IOException {
+        String statusText = switch (statusCode) {
+            case 200 -> "OK";
+            case 201 -> "Created";
+            case 404 -> "Not Found";
+            case 405 -> "Method Not Allowed";
+            default -> "Internal Server Error";
+        };
+
+        byte[] responseBody = content.getBytes("UTF-8");
+        String contentType = "text/plain";
+        if (path.startsWith("/files/")) {
+            Path filePath = Paths.get(fileDirectory, path.substring("/files/".length()));
+            if (Files.exists(filePath)) {
+                String ext = getFileExtension(filePath);
+                contentType = getContentTypeForExtension(ext);
+            }
+        }
+
+        byte[] finalBody = responseBody;
+        if (gzipRequested) {
+            ByteArrayOutputStream byteOut = new ByteArrayOutputStream();
+            try (GZIPOutputStream gzipOut = new GZIPOutputStream(byteOut)) {
+                gzipOut.write(responseBody);
+                gzipOut.finish();
+            }
+            finalBody = byteOut.toByteArray();
+        }
+
+        StringBuilder response = new StringBuilder();
+        response.append("HTTP/1.1 ").append(statusCode).append(" ").append(statusText).append("\r\n");
+        response.append("Content-Type: ").append(contentType).append("\r\n");
+        response.append("Content-Length: ").append(finalBody.length).append("\r\n");
+        if (gzipRequested) response.append("Content-Encoding: gzip\r\n");
+        response.append("Connection: ").append(keepAlive ? "keep-alive" : "close").append("\r\n");
+        response.append("\r\n");
+
+        out.write(response.toString().getBytes("UTF-8"));
+        out.write(finalBody);
+    }
+
+    private static String getFileExtension(Path filePath) {
+        String name = filePath.getFileName().toString();
+        int dot = name.lastIndexOf('.');
+        return dot == -1 ? "" : name.substring(dot + 1);
+    }
+
+    private static String getContentTypeForExtension(String ext) {
+        return switch (ext.toLowerCase()) {
+            case "html", "htm" -> "text/html";
+            case "json" -> "application/json";
+            case "xml" -> "application/xml";
+            case "jpg", "jpeg" -> "image/jpeg";
+            case "png" -> "image/png";
+            case "gif" -> "image/gif";
+            case "css" -> "text/css";
+            case "js" -> "application/javascript";
+            case "txt" -> "text/plain";
+            case "pdf" -> "application/pdf";
+            default -> "application/octet-stream";
+        };
+    }
+}
